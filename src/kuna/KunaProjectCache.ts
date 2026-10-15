@@ -34,6 +34,7 @@ import {
   type KunaExport,
   type KunaExportStatus,
 } from "./KunaProjectExport.js";
+import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import type { KunaProcessLauncher } from "./KunaCommand.js";
 import type {
   KunaInventoryFunction,
@@ -133,6 +134,17 @@ export interface KunaProjectRequest {
   readonly onStatus?: (status: KunaExportStatus) => void;
 }
 
+/** Cleanup this cache still owns and can retry. */
+interface RetainedCleanup {
+  readonly key: string;
+  error: ProviderCleanupError;
+  /** Retries stopping the Kuna process tree; undefined once it is known stopped. */
+  owner: ProviderProcessSupervisor | undefined;
+  /** Whether the process may still be running, so staging must stay. */
+  processUnproven: boolean;
+  readonly staging: string;
+}
+
 interface StagedResult {
   readonly result: Result<KunaProject, AnalysisError>;
   /** Set when an owned process may still write into staging. */
@@ -204,7 +216,7 @@ export class KunaProjectCache {
   readonly #unfinished = new Set<InflightBuild>();
   readonly #verified = new Map<string, KunaProject>();
   readonly #pins = new Map<string, number>();
-  readonly #retained: ProviderCleanupError[] = [];
+  readonly #retained: RetainedCleanup[] = [];
 
   constructor(
     root: string,
@@ -342,28 +354,61 @@ export class KunaProjectCache {
    * process and removed its staging. A build another request still waits for
    * keeps running and is not awaited.
    */
-  async settled(key: string): Promise<void> {
+  async settled(key: string): Promise<Result<null, ProviderCleanupError>> {
     await Promise.allSettled(
       [...this.#unfinished]
         .filter((entry) => entry.key === key && entry.controller.signal.aborted)
         .map((entry) => entry.promise),
     );
+    return this.#retryRetained((retained) => retained.key === key);
   }
 
-  /** Wait for every build in flight and report cleanup this cache still owns. */
+  /**
+   * Wait for every build in flight, retry any cleanup this cache still owns,
+   * and report what remains.
+   */
   async close(): Promise<Result<null, ProviderCleanupError>> {
     await Promise.allSettled(
       [...this.#unfinished].map((entry) => entry.promise),
     );
-    if (this.#retained.length === 0) return ok(null);
+    return this.#retryRetained(() => true);
+  }
+
+  /** Retry stopping retained processes and removing their staging. */
+  async #retryRetained(
+    selected: (retained: RetainedCleanup) => boolean,
+  ): Promise<Result<null, ProviderCleanupError>> {
+    for (const retained of this.#retained.filter(selected)) {
+      if (retained.processUnproven && retained.owner !== undefined) {
+        const stopped = await retained.owner.stop();
+        if (stopped.status !== "incomplete") {
+          retained.processUnproven = false;
+          retained.owner = undefined;
+        }
+      }
+      if (retained.processUnproven) continue;
+      try {
+        await rm(retained.staging, { recursive: true, force: true });
+        this.#retained.splice(this.#retained.indexOf(retained), 1);
+      } catch (cause: unknown) {
+        retained.error = new ProviderCleanupError(
+          KUNA_PROVIDER_ID,
+          [retained.staging],
+          { reason: cause instanceof Error ? cause.message : String(cause) },
+          { operation: KUNA_EXPORT_OPERATION, cause },
+        );
+      }
+    }
+    const remaining = this.#retained.filter(selected);
+    if (remaining.length === 0) return ok(null);
     return err(
       new ProviderCleanupError(
         KUNA_PROVIDER_ID,
-        this.#retained.flatMap((retained) => retained.cleanupResources),
+        remaining.flatMap(({ error }) => error.cleanupResources),
         {
-          reason: this.#retained
-            .map((retained) =>
-              String(retained.diagnostics?.["reason"] ?? retained.message),
+          reason: remaining
+            .map(({ error }) =>
+              String(error.diagnostics?.["reason"] ?? error.message),
             )
             .join("; "),
         },
@@ -437,15 +482,20 @@ export class KunaProjectCache {
     try {
       await rm(staging, { recursive: true, force: true });
     } catch (cause: unknown) {
+      // The process has stopped; only the directory removal needs a retry.
       return err(
-        this.#retain(
-          new ProviderCleanupError(
+        this.#retain({
+          key,
+          error: new ProviderCleanupError(
             KUNA_PROVIDER_ID,
             [staging],
             { reason: cause instanceof Error ? cause.message : String(cause) },
             { operation: KUNA_EXPORT_OPERATION, cause },
           ),
-        ),
+          owner: undefined,
+          processUnproven: false,
+          staging,
+        }),
       );
     }
     if (built.result.ok)
@@ -479,7 +529,18 @@ export class KunaProjectCache {
         `${JSON.stringify({ reason: outcome.error.diagnostics?.["reason"] ?? null, resources: outcome.error.cleanupResources })}\n`,
         { mode: 0o600 },
       ).catch(() => undefined);
-      return { result: err(this.#retain(outcome.error)), retainStaging: true };
+      return {
+        result: err(
+          this.#retain({
+            key,
+            error: outcome.error,
+            owner: outcome.owner,
+            processUnproven: true,
+            staging,
+          }),
+        ),
+        retainStaging: true,
+      };
     }
     return {
       result: outcome.result.ok
@@ -648,8 +709,8 @@ export class KunaProjectCache {
     return readFile(path, "utf8");
   }
 
-  #retain(error: ProviderCleanupError): ProviderCleanupError {
-    this.#retained.push(error);
-    return error;
+  #retain(retained: RetainedCleanup): ProviderCleanupError {
+    this.#retained.push(retained);
+    return retained.error;
   }
 }

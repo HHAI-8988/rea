@@ -12,6 +12,7 @@ import type { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { hashStableFile } from "../filesystem/StableFileHash.js";
 import { prepareProcessOwnershipInspection } from "../process/ProcessOwnershipObservation.js";
+import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import {
   copyAndHash,
   KUNA_INVENTORY_OUTPUT_BYTES,
@@ -80,7 +81,11 @@ export type KunaExportOutcome =
       readonly kind: "done";
       readonly result: Result<KunaExport, AnalysisError>;
     }
-  | { readonly kind: "retained"; readonly error: ProviderCleanupError };
+  | {
+      readonly kind: "retained";
+      readonly error: ProviderCleanupError;
+      readonly owner: ProviderProcessSupervisor | undefined;
+    };
 
 /** One export of a target into a private workspace. */
 export interface KunaExportRequest {
@@ -156,20 +161,6 @@ export const exportKunaProject = async (
         ),
       ),
     };
-  const executable = await hashStableFile(installation.executable, signal);
-  if (executable.sha256 !== installation.sha256)
-    return {
-      kind: "done",
-      result: err(
-        new ProviderAdapterError(KUNA_PROVIDER_ID, KUNA_EXPORT_OPERATION, {
-          userMessage: `${installation.executable} changed after readiness inspection; reopen the target so REA probes the current Kuna executable.`,
-          diagnostics: {
-            expected_sha256: installation.sha256,
-            observed_sha256: executable.sha256,
-          },
-        }),
-      ),
-    };
   await prepareProcessOwnershipInspection(signal);
   const run = async (arguments_: readonly string[], outputBytes: number) => {
     const outcome = await runKunaCommand({
@@ -189,7 +180,11 @@ export const exportKunaProject = async (
       ok: false as const,
       outcome:
         outcome.kind === "retained"
-          ? ({ kind: "retained", error: outcome.error } as const)
+          ? ({
+              kind: "retained",
+              error: outcome.error,
+              owner: outcome.owner,
+            } as const)
           : ({ kind: "done", result: err(outcome.error) } as const),
     };
   };
